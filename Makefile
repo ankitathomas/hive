@@ -322,6 +322,7 @@ podman-dev-build:
 
 podman-operatorhub-build:
 	podman build --tag ${IMG} ${GOCACHE_VOL_ARG} \
+		--isolation chroot \
 		--build-arg=BASE_IMAGE=quay.io/centos/centos:stream9 \
 		--build-arg=BUILD_IMAGE_CUSTOMIZATION=./hack/ubi-build-deps.sh \
 		--build-arg=EL8_BUILD_IMAGE=registry.access.redhat.com/ubi8/ubi:8.10 \
