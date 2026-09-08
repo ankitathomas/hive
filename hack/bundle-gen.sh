@@ -14,6 +14,7 @@ readonly HIVE_REPO_DEFAULT="git@github.com:openshift/hive.git"
 readonly HIVE_SUB_DIR="operators/hive-operator"
 readonly IMAGE_REPO_DEFAULT="quay.io/openshift-hive/hive"
 readonly COMMUNITY_OPERATORS_UPSTREAM="${COMMUNITY_OPERATORS_UPSTREAM:-git@github.com:redhat-openshift-ecosystem/community-operators-prod.git}"
+readonly COMMUNITY_OPERATORS_K8S_UPSTREAM="${COMMUNITY_OPERATORS_K8S_UPSTREAM:-git@github.com:k8s-operatorhub/community-operators.git}"
 readonly CHANNEL_DEFAULT="alpha"
 readonly YQ="${YQ:-yq}"
 
@@ -24,8 +25,8 @@ HOLD=false
 SKIP_RELEASE_CONFIG=false
 SKIP_IMAGE_VALIDATION=false
 GITHUB_USER="${GITHUB_USER:-${USER}}"
-HIVE_REPO="$HIVE_REPO_DEFAULT"
-IMAGE_REPO="$IMAGE_REPO_DEFAULT"
+HIVE_REPO="${HIVE_REPO:-${HIVE_REPO_DEFAULT}}"
+IMAGE_REPO="${IMAGE_REPO:-${IMAGE_REPO_DEFAULT}}"
 IMAGE_TAG_OVERRIDE=""
 COMMIT_ISH=""
 DUMMY_BUNDLE=false
@@ -164,7 +165,89 @@ validate_image() {
         return 1
     fi
 
+    # Check if the tag has expired (deleted image)
+    local end_ts
+    end_ts=$(echo "$resp" | jq -r '.tags[0].end_ts // "null"')
+    if [[ "$end_ts" != "null" ]]; then
+        local current_ts
+        current_ts=$(date +%s)
+        if [[ "$end_ts" -lt "$current_ts" ]]; then
+            echo "Image tag ${image_repo}:${image_tag} has expired"
+            return 1
+        fi
+    fi
+
     echo "Image validated: ${image_repo}:${image_tag}"
+}
+
+# detect_container_tool — finds available container build tool
+detect_container_tool() {
+    if [[ -n "${CONTAINER_TOOL:-}" ]]; then
+        command -v "$CONTAINER_TOOL" &>/dev/null || {
+            echo "Error: specified CONTAINER_TOOL=$CONTAINER_TOOL not found" >&2
+            exit 1
+        }
+        echo "$CONTAINER_TOOL"
+        return 0
+    fi
+
+    # Prefer podman, fallback to buildah, then docker
+    for tool in podman buildah docker; do
+        if command -v "$tool" &>/dev/null; then
+            echo "$tool"
+            return 0
+        fi
+    done
+
+    echo "Error: no container build tool found (podman, buildah, or docker required)" >&2
+    exit 1
+}
+
+# build_oci_image — builds OCI format image with detected tool
+build_oci_image() {
+    local uri="$1" tool="$2"
+
+    local build_args=(
+        --format=oci
+        --tag="$uri"
+        --build-arg=BASE_IMAGE=quay.io/centos/centos:stream9
+        --build-arg=BUILD_IMAGE_CUSTOMIZATION=./hack/ubi-build-deps.sh
+        --build-arg=EL8_BUILD_IMAGE=registry.access.redhat.com/ubi8/ubi:8.10
+        --build-arg=EL9_BUILD_IMAGE=registry.access.redhat.com/ubi9:9.5
+        --build-arg=DNF=dnf
+        -f ./Dockerfile
+        .
+    )
+
+    case "$tool" in
+        podman)
+            # Podman: use oci format, skip isolation flag on non-podman hosts
+            podman build "${build_args[@]}"
+            ;;
+        buildah)
+            # Buildah: bud is the build command
+            buildah bud "${build_args[@]}"
+            ;;
+        docker)
+            # Docker: requires buildx for OCI format
+            if ! docker buildx version &>/dev/null; then
+                echo "Error: docker buildx required for OCI format builds" >&2
+                exit 1
+            fi
+            # Remove --format=oci (not supported), use oci-mediatypes instead
+            docker buildx build \
+                --tag="$uri" \
+                --output type=docker,oci-mediatypes=true \
+                --build-arg=BASE_IMAGE=quay.io/centos/centos:stream9 \
+                --build-arg=BUILD_IMAGE_CUSTOMIZATION=./hack/ubi-build-deps.sh \
+                --build-arg=EL8_BUILD_IMAGE=registry.access.redhat.com/ubi8/ubi:8.10 \
+                --build-arg=EL9_BUILD_IMAGE=registry.access.redhat.com/ubi9:9.5 \
+                --build-arg=DNF=dnf \
+                -f ./Dockerfile \
+                --load \
+                .
+            ;;
+    esac
 }
 
 # ensure_image — validates; builds and pushes if missing.
@@ -180,11 +263,15 @@ ensure_image() {
         return 0
     fi
 
-    echo "Building image $uri"
-    make "IMG=$uri" podman-operatorhub-build || { echo "Image build failed" >&2; exit 1; }
+    local container_tool
+    container_tool=$(detect_container_tool)
+    echo "Using container tool: $container_tool"
+
+    echo "Building OCI image $uri"
+    build_oci_image "$uri" "$container_tool" || { echo "Image build failed" >&2; exit 1; }
 
     echo "Pushing image $uri"
-    podman push "$uri" || { echo "Image push failed" >&2; exit 1; }
+    "$container_tool" push "$uri" || { echo "Image push failed" >&2; exit 1; }
 }
 
 # semver_gt — returns 0 if $1 > $2 using version-aware sort.
@@ -206,7 +293,9 @@ get_previous_version() {
 
     if [[ ! -d "$repo_path" ]]; then
         echo "Cloning $COMMUNITY_OPERATORS_UPSTREAM" >&2
-        git clone "$COMMUNITY_OPERATORS_UPSTREAM" "$repo_path" >&2
+        local clone_url
+        clone_url=$(convert_to_https_url "$COMMUNITY_OPERATORS_UPSTREAM")
+        git clone "$clone_url" "$repo_path" >&2
     fi
 
     git -C "$repo_path" checkout main >&2
@@ -361,20 +450,22 @@ open_pr() {
     repo_name=$(basename "$fork_repo" .git)
     local repo_path="$WORK_DIR/$repo_name"
 
-    # "git@github.com:org/repo.git" -> "org/repo"
-    local gh_target
-    gh_target=$(echo "$upstream_repo" | sed 's|git@github.com:||; s|\.git$||')
+    # Convert URLs once and reuse
+    local fork_url upstream_url gh_target
+    fork_url=$(convert_to_https_url "$fork_repo")
+    upstream_url=$(convert_to_https_url "$upstream_repo")
+    gh_target=$(extract_gh_repo "$upstream_repo")
 
     if [[ ! -d "$repo_path" ]]; then
         echo "Cloning $fork_repo"
-        git clone "$fork_repo" "$repo_path"
+        git clone "$fork_url" "$repo_path"
     else
         echo "Reusing existing clone at $repo_path"
     fi
 
-    git -C "$repo_path" remote set-url origin "$fork_repo"
-    git -C "$repo_path" remote add upstream "$upstream_repo" 2>/dev/null || \
-        git -C "$repo_path" remote set-url upstream "$upstream_repo"
+    git -C "$repo_path" remote set-url origin "$fork_url"
+    git -C "$repo_path" remote add upstream "$upstream_url" 2>/dev/null || \
+        git -C "$repo_path" remote set-url upstream "$upstream_url"
 
     echo "Fetching upstream $upstream_repo"
     git -C "$repo_path" fetch upstream
@@ -450,6 +541,63 @@ check_deps() {
     fi
 }
 
+# setup_robot_credentials — configure authentication for robot accounts
+setup_robot_credentials() {
+    # GitHub token for gh CLI and git operations
+    if [[ -n "${GH_TOKEN:-}" ]]; then
+        echo "Using GH_TOKEN for GitHub authentication"
+        export GH_TOKEN
+        # Prevent interactive git prompts
+        export GIT_TERMINAL_PROMPT=0
+    fi
+
+    # Validate GITHUB_USER is set (required for PR creation)
+    if [[ -z "${GITHUB_USER:-}" ]]; then
+        echo "Error: GITHUB_USER environment variable is not set" >&2
+        echo "  Set GITHUB_USER to your GitHub username (used for fork repository)" >&2
+        exit 1
+    fi
+
+    # Configure git identity (required for commits)
+    local git_user_name="${GIT_USER_NAME:-${GITHUB_USER}}"
+    local git_user_email="${GIT_USER_EMAIL:-${GITHUB_USER}@users.noreply.github.com}"
+
+    git config --global user.name "$git_user_name"
+    git config --global user.email "$git_user_email"
+    echo "Configured git identity: $git_user_name <$git_user_email>"
+
+    # Quay.io authentication for podman
+    if [[ -n "${QUAY_TOKEN_FILE}" && -n "${QUAY_USER_FILE}" ]]; then
+        echo "Using QUAY_TOKEN for container registry authentication"
+        echo -n '{"auths": {"quay.io": {"auth": "'"$(echo -n "$(cat "${QUAY_USER_FILE}")":"$(cat "${QUAY_TOKEN_FILE}")" | base64 -w 0 )"'"}}}' >> "${WORK_DIR}/quay_auth.json"
+        export REGISTRY_AUTH_FILE="${WORK_DIR}/quay_auth.json"
+    fi
+}
+
+# convert_to_https_url — If a GH_TOKEN is found, convert SSH URLs to HTTPS with embedded token
+convert_to_https_url() {
+    local url="$1"
+    if [[ -n "${GH_TOKEN:-}" ]] && [[ "$url" =~ ^git@github\.com:(.+)$ ]]; then
+        echo "https://${GH_TOKEN}@github.com/${BASH_REMATCH[1]}"
+    else
+        echo "$url"
+    fi
+}
+
+# extract_gh_repo — extract org/repo from HTTPS/SSH GitHub URL
+# expects url in format git@github.com/<repo path> or https://github.com/<repo path>
+extract_gh_repo() {
+    local url="$1"
+    if [[ "$url" =~ git@github\.com:(.+)\.git$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+    elif [[ "$url" =~ github\.com/([-a-zA-Z0-9_]+/[-a-zA-Z0-9_]+)(\.git)?$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+    else
+        echo "Error: Unable to parse GitHub repo from URL: $url" >&2
+        exit 1
+    fi
+}
+
 # main
 main() {
     parse_args "$@"
@@ -464,8 +612,12 @@ main() {
     BUNDLE_DIR=$(mktemp -d --tmpdir hive-operator-bundle-XXXXXX)
     WORK_DIR=$(mktemp -d --tmpdir operatorhub-push-XXXXXX)
 
+    setup_robot_credentials
+
     echo "Cloning $HIVE_REPO to $HIVE_REPO_DIR"
-    git clone "$HIVE_REPO" "$HIVE_REPO_DIR"
+    local hive_repo_url
+    hive_repo_url=$(convert_to_https_url "$HIVE_REPO")
+    git clone "$hive_repo_url" "$HIVE_REPO_DIR"
 
     cd "$HIVE_REPO_DIR"
 
@@ -510,14 +662,20 @@ main() {
         generate_bundle "$BUNDLE_DIR" "$IMAGE_REPO" "$ver_semver" "$image_tag"
         add_operatorhub_extras "$BUNDLE_DIR/$ver_semver" "$ver_semver" "$prev_version"
 
+        # Extract repo name from upstream URL to construct fork URL
+        # git@github.com:org/repo.git -> repo.git
+        local prod_repo_name k8s_repo_name
+        prod_repo_name=$(basename "$COMMUNITY_OPERATORS_UPSTREAM")
+        k8s_repo_name=$(basename "$COMMUNITY_OPERATORS_K8S_UPSTREAM")
+
         open_pr \
-            "git@github.com:${GITHUB_USER}/community-operators-prod.git" \
-            "git@github.com:redhat-openshift-ecosystem/community-operators-prod.git" \
+            "git@github.com:${GITHUB_USER}/${prod_repo_name}" \
+            "$COMMUNITY_OPERATORS_UPSTREAM" \
             "$ver_semver" "$BUNDLE_DIR"
 
         open_pr \
-            "git@github.com:${GITHUB_USER}/community-operators.git" \
-            "git@github.com:k8s-operatorhub/community-operators.git" \
+            "git@github.com:${GITHUB_USER}/${k8s_repo_name}" \
+            "$COMMUNITY_OPERATORS_K8S_UPSTREAM" \
             "$ver_semver" "$BUNDLE_DIR"
     fi
 }

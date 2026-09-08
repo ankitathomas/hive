@@ -1,0 +1,211 @@
+name: Publish OperatorHub Bundle
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: 'Commit SHA to publish (leave empty for latest master)'
+        required: false
+        type: string
+      hive_repo:
+        description: 'Hive git repo to clone (default: git@github.com:openshift/hive.git)'
+        required: false
+        type: string
+      image_repo:
+        description: 'Image repository without tag (default: quay.io/openshift-hive/hive)'
+        required: false
+        type: string
+      image_tag_override:
+        description: 'Override image tag (default: first 10 chars of commit SHA)'
+        required: false
+        type: string
+      dry_run:
+        description: 'Dry run mode (skip image push and PR creation)'
+        required: false
+        type: boolean
+        default: false
+      hold:
+        description: 'Add /hold to PRs to prevent auto-merge'
+        required: false
+        type: boolean
+        default: false
+      skip_release_config:
+        description: 'Skip generating release-config.yaml (OperatorHub mode only)'
+        required: false
+        type: boolean
+        default: false
+      skip_image_validation:
+        description: 'Skip checking if image exists before building'
+        required: false
+        type: boolean
+        default: false
+      dummy_bundle:
+        description: 'Generate bundle locally only (no PRs, no version graph)'
+        required: false
+        type: boolean
+        default: false
+      verbose:
+        description: 'Show verbose output during execution'
+        required: false
+        type: boolean
+        default: true
+      git_user_name:
+        description: 'git user name to sign off on commit.'
+        required: false
+        type: string
+        default: openshift-hive-publisher-bot
+      git_user_email:
+        description: 'git user email to sign off on commit'
+        required: false
+        type: string
+        default: openshift-hive-publisher-bot@users.noreply.github.com
+      community_operators_upstream:
+        description: 'Upstream community operators repository to make a commit against'
+        required: false
+        type: string
+        default: git@github.com:redhat-openshift-ecosystem/community-operators-prod.git
+      community_operators_k8s_upstream:
+        description: 'Upstream kubernetes operators repository to make a commit against'
+        required: false
+        type: string
+        default: git@github.com:k8s-operatorhub/community-operators.git
+
+jobs:
+  publish-bundle:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history needed for version calculation
+
+      - name: Install dependencies
+        run: |
+          # Update package list
+          sudo apt-get update
+
+          # Install podman (produces OCI format by default)
+          sudo apt-get install -y podman
+
+          # Install jq
+          sudo apt-get install -y jq
+
+          # Install yq v4
+          YQ_VERSION=v4.47.1
+          sudo curl -L "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" -o /usr/bin/yq
+          sudo chmod +x /usr/bin/yq
+
+          # Install gh CLI
+          (type -p wget >/dev/null || (sudo apt-get update && sudo apt-get install -y wget)) \
+            && sudo mkdir -p -m 755 /etc/apt/keyrings \
+            && wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
+            && sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+            && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+            && sudo apt-get update \
+            && sudo apt-get install -y gh
+
+      - name: Verify tool versions
+        run: |
+          echo "Podman version:"
+          podman --version
+          echo "yq version:"
+          yq --version
+          echo "gh version:"
+          gh --version
+          echo "jq version:"
+          jq --version
+
+      - name: Setup Git identity
+        run: |
+          git config --global user.name "Hive Bundle Bot"
+          git config --global user.email "hive-bot@users.noreply.github.com"
+
+      - name: Setup Quay.io credentials
+        if: ${{ !inputs.dry_run }}
+        env:
+          QUAY_USER: ${{ secrets.QUAY_USER }}
+          QUAY_TOKEN: ${{ secrets.QUAY_TOKEN }}
+        run: |
+          mkdir -p /tmp/quay-creds
+          echo -n "$QUAY_USER" > /tmp/quay-creds/user
+          echo -n "$QUAY_TOKEN" > /tmp/quay-creds/token
+      - name: Run bundle generation
+        env:
+          GH_TOKEN: ${{ secrets.BUNDLE_GH_TOKEN }}
+          GITHUB_USER: ${{ secrets.BUNDLE_GITHUB_USER }}
+          QUAY_TOKEN_FILE: /tmp/quay-creds/token
+          QUAY_USER_FILE: /tmp/quay-creds/user
+          CONTAINER_TOOL: podman
+          GIT_TERMINAL_PROMPT: "0"
+          GIT_USER_NAME: ${{ inputs.git_user_name }}
+          GIT_USER_EMAIL: ${{ inputs.git_user_email }}
+          COMMUNITY_OPERATORS_UPSTREAM: ${{ inputs.community_operators_upstream }}
+          COMMUNITY_OPERATORS_K8S_UPSTREAM: ${{ inputs.community_operators_k8s_upstream }}
+
+        run: |
+          cd hack
+
+          ARGS=()
+
+          # Add boolean flags
+          if [[ "${{ inputs.verbose }}" == "true" ]]; then
+            ARGS+=("--verbose")
+          fi
+
+          if [[ "${{ inputs.dry_run }}" == "true" ]]; then
+            ARGS+=("--dry-run")
+          fi
+
+          if [[ "${{ inputs.hold }}" == "true" ]]; then
+            ARGS+=("--hold")
+          fi
+
+          if [[ "${{ inputs.skip_release_config }}" == "true" ]]; then
+            ARGS+=("--skip-release-config")
+          fi
+
+          if [[ "${{ inputs.skip_image_validation }}" == "true" ]]; then
+            ARGS+=("--skip-image-validation")
+          fi
+
+          if [[ "${{ inputs.dummy_bundle }}" == "true" ]]; then
+            ARGS+=("--dummy-bundle")
+          fi
+
+          # Add value-based flags
+          if [[ -n "${{ inputs.commit }}" ]]; then
+            ARGS+=("--commit" "${{ inputs.commit }}")
+          fi
+
+          if [[ -n "${{ inputs.hive_repo }}" ]]; then
+            ARGS+=("--hive-repo" "${{ inputs.hive_repo }}")
+          fi
+
+          if [[ -n "${{ inputs.image_repo }}" ]]; then
+            ARGS+=("--image-repo" "${{ inputs.image_repo }}")
+          fi
+
+          if [[ -n "${{ inputs.image_tag_override }}" ]]; then
+            ARGS+=("--image-tag-override" "${{ inputs.image_tag_override }}")
+          fi
+
+          # Run bundle-gen.sh with all configured arguments
+          ./bundle-gen.sh "${ARGS[@]}"
+
+      - name: Cleanup credentials
+        if: always()
+        run: |
+          rm -rf /tmp/quay-creds
+
+      - name: Output summary
+        if: success()
+        run: |
+          echo "✅ Bundle generation completed successfully!"
+          echo ""
+          echo "Next steps:"
+          echo "1. Check the PRs created in:"
+          echo "   - https://github.com/redhat-openshift-ecosystem/community-operators-prod"
+          echo "   - https://github.com/k8s-operatorhub/community-operators"
+          echo "2. Monitor CI checks on those PRs"
+          echo "3. Address any review comments"
